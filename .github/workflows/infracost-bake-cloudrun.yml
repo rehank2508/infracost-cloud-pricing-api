@@ -1,0 +1,136 @@
+name: Bake DB & Deploy Infracost Cloud Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      apiImageTag:
+        description: "Tag of cloud-pricing-api image (usually git SHA)"
+        required: true
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  bake-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_PROJECT: techcyte-infracost-poc
+      GCP_REGION: asia-south1
+      AR_REPO: infracost
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up gcloud with service account key
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Enable required APIs
+        run: |
+          gcloud services enable artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker $GCP_REGION-docker.pkg.dev
+
+      - name: Compute image names
+        run: |
+          GIT_SHA="${{ github.sha }}"
+          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
+          echo "API_IMAGE=$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/cloud-pricing-api:${{ github.event.inputs.apiImageTag }}" >> $GITHUB_ENV
+          echo "DB_IMAGE_BASE=$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/prebaked-pg" >> $GITHUB_ENV
+
+      - name: Pull API image
+        run: docker pull "$API_IMAGE"
+
+      - name: Create Docker network
+        run: docker network create infracost-net || true
+
+      - name: Start Postgres container
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          docker run -d --name infracost-pg \
+            --network=infracost-net \
+            -e POSTGRES_DB=cloud_pricing \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+            postgres:13
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            if docker exec infracost-pg pg_isready -U postgres; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Run job:init to populate DB
+        env:
+          INFRACOST_UPSTREAM_API_KEY: ${{ secrets.INFRACOST_UPSTREAM_API_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          docker run --rm \
+            --network=infracost-net \
+            -e INFRACOST_API_KEY="$INFRACOST_UPSTREAM_API_KEY" \
+            -e POSTGRES_HOST=infracost-pg \
+            -e POSTGRES_DB=cloud_pricing \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+            "$API_IMAGE" \
+            sh -c "npm run job:init"
+
+      - name: Stop Postgres
+        run: docker stop infracost-pg
+
+      # 🟩 Bake DB image using SAME TAG as API SHA
+      - name: Commit baked Postgres image
+        run: |
+          docker commit infracost-pg "$DB_IMAGE_BASE:$GIT_SHA"
+          docker tag "$DB_IMAGE_BASE:$GIT_SHA" "$DB_IMAGE_BASE:latest"
+
+      - name: Push baked DB image
+        run: |
+          docker push "$DB_IMAGE_BASE:$GIT_SHA"
+          docker push "$DB_IMAGE_BASE:latest"
+
+      # Secrets Management
+      - name: Upsert secrets in Secret Manager
+        env:
+          SELF_HOSTED_KEY: ${{ secrets.SELF_HOSTED_INFRACOST_API_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          echo -n "$SELF_HOSTED_KEY" > self_hosted_key.txt
+          if gcloud secrets describe infracost-self-hosted-key >/dev/null 2>&1; then
+            gcloud secrets versions add infracost-self-hosted-key --data-file=self_hosted_key.txt
+          else
+            gcloud secrets create infracost-self-hosted-key --data-file=self_hosted_key.txt
+          fi
+
+          echo -n "$DB_PASSWORD" > db_password.txt
+          if gcloud secrets describe infracost-db-password >/dev/null 2>&1; then
+            gcloud secrets versions add infracost-db-password --data-file=db_password.txt
+          else
+            gcloud secrets create infracost-db-password --data-file=db_password.txt
+          fi
+
+      # Render Cloud Run YAML
+      - name: Render Cloud Run YAML
+        run: |
+          mkdir -p cloudrun/rendered
+          cp cloudrun/service.tmpl.yaml cloudrun/rendered/service.yaml
+
+          sed -i "s|REPLACE_API_IMAGE|$API_IMAGE|" cloudrun/rendered/service.yaml
+          sed -i "s|REPLACE_DB_IMAGE|$DB_IMAGE_BASE:$GIT_SHA|" cloudrun/rendered/service.yaml
+
+      - name: Deploy Cloud Run
+        run: |
+          gcloud run services replace cloudrun/rendered/service.yaml \
+            --region=$GCP_REGION \
+            --project=$GCP_PROJECT
