@@ -9,7 +9,6 @@ spec:
         run.googleapis.com/launch-stage: GA
         run.googleapis.com/cpu-throttling: "false"
     spec:
-      # Runtime service account (no key needed)
       serviceAccountName: infracost-sa@techcyte-infracost-poc.iam.gserviceaccount.com
       containerConcurrency: 80
       containers:
@@ -20,12 +19,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: infracost-self-hosted-key
-                  version: "latest"
+                  key: "latest"          # ⬅ changed from version -> key
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: infracost-db-password
-                  version: "latest"
+                  key: "latest"          # ⬅ same here
             - name: POSTGRES_USER
               value: "postgres"
             - name: POSTGRES_DB
@@ -42,7 +41,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: infracost-db-password
-                  version: "latest"
+                  key: "latest"          # ⬅ and here
             - name: POSTGRES_DB
               value: "cloud_pricing"
             - name: POSTGRES_USER
