@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       apiImageTag:
-        description: "Tag of cloud-pricing-api image (usually git SHA)"
+        description: "Tag of cloud-pricing-api image in your registry (e.g. latest or git SHA)"
         required: true
         default: "latest"
 
@@ -24,16 +24,21 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up gcloud with service account key
-        uses: google-github-actions/setup-gcloud@v2
+      - id: 'auth'
+        uses: 'google-github-actions/auth@v3'
         with:
           project_id: ${{ env.GCP_PROJECT }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          export_default_credentials: true
+          service_account: 'github-actions@techcyte-infracost-poc.iam.gserviceaccount.com'
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Enable required APIs
-        run: |
-          gcloud services enable artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com
+      - name: Set up gcloud with service account key
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      # - name: Enable required APIs
+      #   run: |
+      #     gcloud services enable artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com
 
       - name: Configure Docker for Artifact Registry
         run: |
@@ -41,17 +46,23 @@ jobs:
 
       - name: Compute image names
         run: |
-          GIT_SHA="${{ github.sha }}"
-          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
-          echo "API_IMAGE=$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/cloud-pricing-api:${{ github.event.inputs.apiImageTag }}" >> $GITHUB_ENV
+          API_TAG="${{ github.event.inputs.apiImageTag }}"
+          echo "API_TAG=$API_TAG" >> $GITHUB_ENV
+
+          echo "API_IMAGE=$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/cloud-pricing-api:$API_TAG" >> $GITHUB_ENV
           echo "DB_IMAGE_BASE=$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/prebaked-pg" >> $GITHUB_ENV
 
+      # 1) Pull your mirrored Infracost API image
       - name: Pull API image
-        run: docker pull "$API_IMAGE"
+        run: |
+          docker pull "$API_IMAGE"
 
+      # 2) Create Docker network for API <-> Postgres
       - name: Create Docker network
-        run: docker network create infracost-net || true
+        run: |
+          docker network create infracost-net || true
 
+      # 3) Start empty Postgres
       - name: Start Postgres container
         env:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -63,14 +74,21 @@ jobs:
             -e POSTGRES_PASSWORD="$DB_PASSWORD" \
             postgres:13
 
+      # 4) Wait for Postgres to be ready
       - name: Wait for Postgres
         run: |
           for i in {1..30}; do
-            if docker exec infracost-pg pg_isready -U postgres; then exit 0; fi
+            if docker exec infracost-pg pg_isready -U postgres; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            echo "Waiting for Postgres..."
             sleep 5
           done
+          echo "Postgres did not become ready in time"
           exit 1
 
+      # 5) Run job:init in your API image to populate DB
       - name: Run job:init to populate DB
         env:
           INFRACOST_UPSTREAM_API_KEY: ${{ secrets.INFRACOST_UPSTREAM_API_KEY }}
@@ -86,49 +104,63 @@ jobs:
             "$API_IMAGE" \
             sh -c "npm run job:init"
 
-      - name: Stop Postgres
-        run: docker stop infracost-pg
+      # 6) Stop Postgres
+      - name: Stop Postgres container
+        run: |
+          docker stop infracost-pg
 
-      # 🟩 Bake DB image using SAME TAG as API SHA
+      # 7) Commit baked DB image (tag = same as API tag)
       - name: Commit baked Postgres image
         run: |
-          docker commit infracost-pg "$DB_IMAGE_BASE:$GIT_SHA"
-          docker tag "$DB_IMAGE_BASE:$GIT_SHA" "$DB_IMAGE_BASE:latest"
+          docker commit infracost-pg "$DB_IMAGE_BASE:$API_TAG"
+          docker tag "$DB_IMAGE_BASE:$API_TAG" "$DB_IMAGE_BASE:latest"
 
+      # 8) Push baked DB image
       - name: Push baked DB image
         run: |
-          docker push "$DB_IMAGE_BASE:$GIT_SHA"
+          docker push "$DB_IMAGE_BASE:$API_TAG"
           docker push "$DB_IMAGE_BASE:latest"
 
-      # Secrets Management
+      # 9) Upsert secrets in Secret Manager
       - name: Upsert secrets in Secret Manager
         env:
           SELF_HOSTED_KEY: ${{ secrets.SELF_HOSTED_INFRACOST_API_KEY }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
+          # Self-hosted key
           echo -n "$SELF_HOSTED_KEY" > self_hosted_key.txt
           if gcloud secrets describe infracost-self-hosted-key >/dev/null 2>&1; then
             gcloud secrets versions add infracost-self-hosted-key --data-file=self_hosted_key.txt
           else
-            gcloud secrets create infracost-self-hosted-key --data-file=self_hosted_key.txt
+            gcloud secrets create infracost-self-hosted-key \
+              --replication-policy="automatic" \
+              --data-file=self_hosted_key.txt
           fi
 
+          # DB password
           echo -n "$DB_PASSWORD" > db_password.txt
           if gcloud secrets describe infracost-db-password >/dev/null 2>&1; then
             gcloud secrets versions add infracost-db-password --data-file=db_password.txt
           else
-            gcloud secrets create infracost-db-password --data-file=db_password.txt
+            gcloud secrets create infracost-db-password \
+              --replication-policy="automatic" \
+              --data-file=db_password.txt
           fi
 
-      # Render Cloud Run YAML
+      # 10) Render Cloud Run YAML
       - name: Render Cloud Run YAML
         run: |
           mkdir -p cloudrun/rendered
           cp cloudrun/service.tmpl.yaml cloudrun/rendered/service.yaml
 
-          sed -i "s|REPLACE_API_IMAGE|$API_IMAGE|" cloudrun/rendered/service.yaml
-          sed -i "s|REPLACE_DB_IMAGE|$DB_IMAGE_BASE:$GIT_SHA|" cloudrun/rendered/service.yaml
+          API_TAG="${{ github.event.inputs.apiImageTag }}"
+          API_IMAGE="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/cloud-pricing-api:$API_TAG"
+          DB_IMAGE="$DB_IMAGE_BASE:$API_TAG"
 
+          sed -i "s|REPLACE_API_IMAGE|$API_IMAGE|" cloudrun/rendered/service.yaml
+          sed -i "s|REPLACE_DB_IMAGE|$DB_IMAGE|" cloudrun/rendered/service.yaml
+
+      # 11) Deploy Cloud Run
       - name: Deploy Cloud Run
         run: |
           gcloud run services replace cloudrun/rendered/service.yaml \

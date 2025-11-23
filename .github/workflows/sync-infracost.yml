@@ -1,0 +1,60 @@
+name: Sync Official Infracost API to Artifact Registry
+
+on:
+  workflow_dispatch: {}
+#   schedule:
+#     - cron: "0 3 * * SUN"   # optional weekly sync
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_PROJECT: techcyte-infracost-poc
+      GCP_REGION: asia-south1
+      AR_REPO: infracost
+      SRC_IMAGE: infracost/cloud-pricing-api:latest
+      DST_IMAGE_BASE: asia-south1-docker.pkg.dev/techcyte-infracost-poc/infracost/cloud-pricing-api
+
+    steps:
+      - id: 'auth'
+        uses: 'google-github-actions/auth@v3'
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account: 'github-actions@techcyte-infracost-poc.iam.gserviceaccount.com'
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud with service account key
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+    #   - name: Enable Artifact Registry API
+    #     run: gcloud services enable artifactregistry.googleapis.com
+
+      - name: Auth Docker to Artifact Registry
+        run: gcloud auth configure-docker $GCP_REGION-docker.pkg.dev
+
+      - name: Pull official Infracost image
+        run: docker pull "$SRC_IMAGE"
+
+      - name: Tag for our registry
+        run: |
+          GIT_SHA="${GITHUB_SHA::7}"
+          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
+          docker tag "$SRC_IMAGE" "$DST_IMAGE_BASE:latest"
+          docker tag "$SRC_IMAGE" "$DST_IMAGE_BASE:$GIT_SHA"
+
+      - name: Push to Artifact Registry
+        run: |
+          docker push "$DST_IMAGE_BASE:latest"
+          docker push "$DST_IMAGE_BASE:$GIT_SHA"
+
+      - name: Print tags
+        run: |
+          echo "Pushed:"
+          echo "  $DST_IMAGE_BASE:latest"
+          echo "  $DST_IMAGE_BASE:$GIT_SHA"

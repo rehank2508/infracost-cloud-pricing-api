@@ -1,8 +1,8 @@
 name: Build & Push cloud-pricing-api
 
 on:
-  push:
-    branches: [ master ]
+  # push:
+  #   branches: [ master ]
   workflow_dispatch: {}
 
 permissions:
@@ -24,7 +24,8 @@ jobs:
       - id: 'auth'
         uses: 'google-github-actions/auth@v3'
         with:
-          service_account: 'my-service-account@my-project.iam.gserviceaccount.com'
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account: 'github-actions@techcyte-infracost-poc.iam.gserviceaccount.com'
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up gcloud with service account key
