@@ -1,0 +1,66 @@
+name: Build & Push cloud-pricing-api
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push-api:
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_PROJECT: techcyte-infracost-poc
+      GCP_REGION: asia-south1
+      AR_REPO: infracost
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up gcloud with service account key
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Enable Artifact Registry API
+        run: |
+          gcloud services enable artifactregistry.googleapis.com
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker $GCP_REGION-docker.pkg.dev
+
+      - name: Compute image tags
+        run: |
+          IMAGE_BASE="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT/$AR_REPO/cloud-pricing-api"
+          GIT_SHA="${GITHUB_SHA::7}"
+
+          echo "IMAGE_BASE=$IMAGE_BASE" >> $GITHUB_ENV
+          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
+          echo "IMAGE_SHA_TAG=$IMAGE_BASE:$GIT_SHA" >> $GITHUB_ENV
+          echo "IMAGE_LATEST_TAG=$IMAGE_BASE:latest" >> $GITHUB_ENV
+
+      - name: Build API image
+        run: |
+          docker build \
+            -t "$IMAGE_SHA_TAG" \
+            -t "$IMAGE_LATEST_TAG" \
+            -f cloudrun/Dockerfile.api \
+            .
+
+      - name: Push API image
+        run: |
+          docker push "$IMAGE_SHA_TAG"
+          docker push "$IMAGE_LATEST_TAG"
+
+      - name: Output built tags
+        run: |
+          echo "Built and pushed:"
+          echo "  $IMAGE_SHA_TAG"
+          echo "  $IMAGE_LATEST_TAG"

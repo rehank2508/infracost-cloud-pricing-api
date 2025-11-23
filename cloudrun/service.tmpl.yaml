@@ -1,0 +1,49 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: infracost-pricing
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/launch-stage: GA
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      # Runtime service account (no key needed)
+      serviceAccountName: infracost-sa@techcyte-infracost-poc.iam.gserviceaccount.com
+      containerConcurrency: 80
+      containers:
+        - name: api
+          image: REPLACE_API_IMAGE
+          env:
+            - name: SELF_HOSTED_INFRACOST_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: infracost-self-hosted-key
+                  version: "latest"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: infracost-db-password
+                  version: "latest"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_DB
+              value: "cloud_pricing"
+            - name: POSTGRES_HOST
+              value: "127.0.0.1"
+          ports:
+            - containerPort: 4000
+
+        - name: db
+          image: REPLACE_DB_IMAGE
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: infracost-db-password
+                  version: "latest"
+            - name: POSTGRES_DB
+              value: "cloud_pricing"
+            - name: POSTGRES_USER
+              value: "postgres"
